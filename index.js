@@ -7,18 +7,15 @@ const fs = require('fs');
 const app = express();
 const server = http.createServer(app);
 
-// Scalingo 动态分配的端口
 const PORT = process.env.PORT || 3000;
-// 引擎内部监听端口 (不暴露到公网)
 const ENGINE_PORT = 30002;
 
-// 环境变量配置 (可以在 Scalingo 控制台修改)
 const UUID = process.env.UUID || '9afd1229-b893-40c1-84dd-51e7ce204913';
 const WS_PATH = process.env.WS_PATH || '/vcc';
 
-// 1. 动态生成隐蔽的引擎配置文件
+// 1. 动态生成引擎配置文件
 const config = {
-  log: { access: "none", error: "none", loglevel: "none" },
+  log: { access: "none", error: "none", loglevel: "warning" },
   inbounds: [{
       port: ENGINE_PORT,
       listen: "127.0.0.1",
@@ -30,14 +27,19 @@ const config = {
 };
 fs.writeFileSync('config.json', JSON.stringify(config));
 
-// 2. 赋予核心进程执行权限并静默启动
+// 2. 赋予核心进程执行权限并拉起
 try {
     fs.chmodSync('./miku_engine', 0o755);
+    console.log('[System] Permissions set for engine.');
 } catch (e) {
-    // 忽略权限修改错误，防崩溃
+    console.error('[System] chmod failed, file might already be executable.');
 }
+
+// 启动引擎并捕获基本状态 (用于排错)
 const engine = spawn('./miku_engine', ['-config', 'config.json']);
-engine.on('error', () => {}); // 屏蔽错误日志
+engine.stdout.on('data', (data) => console.log(`[Engine]: ${data.toString().trim()}`));
+engine.stderr.on('data', (data) => console.error(`[Engine Error]: ${data.toString().trim()}`));
+engine.on('close', (code) => console.log(`[Engine] Exited with code ${code}`));
 
 // 3. 托管 Mikutap 前端静态资源
 const mikutapDirs = ['css', 'data', 'js', 'shared'];
@@ -47,7 +49,7 @@ mikutapDirs.forEach(dir => {
 app.get('/icon.png', (req, res) => res.sendFile(path.join(__dirname, 'icon.png')));
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
 
-// 4. WebSocket 流量反向代理 (纯净转发，无特征)
+// 4. WebSocket 流量反向代理 (已修复握手挂起问题)
 server.on('upgrade', (req, socket, head) => {
     if (req.url === WS_PATH) {
         const proxy = http.request({
@@ -57,21 +59,32 @@ server.on('upgrade', (req, socket, head) => {
             headers: req.headers,
             path: req.url
         });
+
         proxy.on('upgrade', (proxyRes, proxySocket, proxyHead) => {
-            socket.write(
-                `HTTP/${req.httpVersion} 101 Switching Protocols\r\n` +
-                Object.keys(proxyRes.headers).map(k => `${k}: ${proxyRes.headers[k]}`).join('\r\n') +
-                '\r\n\r\n'
-            );
+            // 重写响应头，完成 WebSocket 握手
+            let response = `HTTP/${req.httpVersion} 101 Switching Protocols\r\n`;
+            for (let key in proxyRes.headers) {
+                response += `${key}: ${proxyRes.headers[key]}\r\n`;
+            }
+            response += '\r\n';
+            socket.write(response);
+            
+            // 建立双向数据流管道
             proxySocket.pipe(socket).pipe(proxySocket);
         });
-        proxy.on('error', () => { socket.end(); });
-        req.pipe(proxy);
+
+        proxy.on('error', (err) => {
+            console.error('[Proxy] Error:', err.message);
+            socket.destroy();
+        });
+
+        // 【关键修复点】必须调用 end() 结束 HTTP 请求阶段，否则底层无法收到握手信息
+        proxy.end();
     } else {
         socket.destroy();
     }
 });
 
 server.listen(PORT, () => {
-     console.log('Interactive web application is successfully running.');
+     console.log(`[System] Interactive web application is running on port ${PORT}`);
 });
